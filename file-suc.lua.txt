@@ -1,0 +1,1035 @@
+--[[===========================================================
+    POTATO MODE EXTREME  v3
+    RIVALS client-side optimizer + tracker + aimbot
+    Mobile / Delta Executor
+============================================================]]
+
+local Players          = game:GetService("Players")
+local Lighting         = game:GetService("Lighting")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+
+local LP  = Players.LocalPlayer
+local ENV = (getgenv and getgenv()) or _G
+
+if ENV.PME and ENV.PME.shutdown then pcall(ENV.PME.shutdown) end
+if ENV.PME_GUI then pcall(function() ENV.PME_GUI:Destroy() end) end
+
+---------------------------------------------------------------
+-- PALETTE
+---------------------------------------------------------------
+local NEON       = Color3.fromRGB(57, 255, 20)
+local NEON_DIM   = Color3.fromRGB(32, 128, 14)
+local BG         = Color3.fromRGB(7, 7, 7)
+local PANEL      = Color3.fromRGB(17, 17, 17)
+local TEXT       = Color3.fromRGB(228, 228, 228)
+local MUTED      = Color3.fromRGB(122, 122, 122)
+local RED        = Color3.fromRGB(255, 45, 45)
+local TARGET_COL = Color3.fromRGB(0, 255, 140)
+
+---------------------------------------------------------------
+-- STATE
+---------------------------------------------------------------
+local active     = false
+local busy       = false
+local restoring  = false
+local optimized  = 0
+local aimSpeed   = 0.55
+local autoAim    = false
+local autoTarget = nil
+
+local store      = {}
+local queue      = {}
+local qHead      = 1
+local queued     = {}
+local conns      = {}
+local playerWatches = {}
+local highlights = {}
+local currentTarget = nil
+local espFolder  = nil
+local worker     = nil
+local refreshRows = function() end
+
+---------------------------------------------------------------
+-- STORE
+---------------------------------------------------------------
+local function save(inst, prop, value)
+	local e = store[inst]
+	if not e then
+		e = { __has = {} }
+		store[inst] = e
+	end
+	if not e.__has[prop] then
+		local ok, old = pcall(function() return inst[prop] end)
+		if not ok then return end
+		e[prop] = old
+		e.__has[prop] = true
+	end
+	pcall(function() inst[prop] = value end)
+end
+
+local function restoreAll(done)
+	local list = {}
+	for inst, props in pairs(store) do
+		list[#list + 1] = { inst, props }
+	end
+	store = {}
+
+	local i = 1
+	task.spawn(function()
+		while i <= #list do
+			local budget = 400
+			while i <= #list and budget > 0 do
+				local entry = list[i]
+				i = i + 1
+				budget = budget - 1
+				local inst, props = entry[1], entry[2]
+				if typeof(inst) == "Instance" then
+					for prop, val in pairs(props) do
+						if prop ~= "__has" then
+							pcall(function() inst[prop] = val end)
+						end
+					end
+				end
+			end
+			task.wait()
+		end
+		if done then done() end
+	end)
+end
+
+---------------------------------------------------------------
+-- GREY
+---------------------------------------------------------------
+local function greyOf(c)
+	local lum = 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B
+	lum = math.clamp(lum, 0, 1)
+	local g = 0.26 + lum * 0.40
+	return Color3.new(g, g, g)
+end
+
+local HIDE_TOKENS = {"grass","foliage","bush","weed","leaf","shrub","plant","fern","flower"}
+local KEEP_TOKENS = {"ground","floor","baseplate","wall","road","terrain","slab"}
+
+local function isVegetation(inst, material)
+	if material == Enum.Material.Grass or material == Enum.Material.LeafyGrass then
+		return true
+	end
+	local n = string.lower(inst.Name)
+	for _, t in ipairs(HIDE_TOKENS) do
+		if string.find(n, t, 1, true) then
+			for _, k in ipairs(KEEP_TOKENS) do
+				if string.find(n, k, 1, true) then return false end
+			end
+			return true
+		end
+	end
+	return false
+end
+
+local EFFECT_PROP = {
+	ParticleEmitter       = "Enabled",
+	Trail                 = "Enabled",
+	Beam                  = "Enabled",
+	Smoke                 = "Enabled",
+	Fire                  = "Enabled",
+	Sparkles              = "Enabled",
+	Explosion             = "Visible",
+	BloomEffect           = "Enabled",
+	BlurEffect            = "Enabled",
+	SunRaysEffect         = "Enabled",
+	DepthOfFieldEffect    = "Enabled",
+	ColorCorrectionEffect = "Enabled",
+}
+
+local function process(inst)
+	if not active then return end
+	local cls = inst.ClassName
+
+	if inst:IsA("BasePart") then
+		local mat = inst.Material
+		if mat ~= Enum.Material.Neon and mat ~= Enum.Material.ForceField then
+			save(inst, "Material", Enum.Material.SmoothPlastic)
+		end
+		save(inst, "Color", greyOf(inst.Color))
+		save(inst, "Reflectance", 0)
+		save(inst, "CastShadow", false)
+
+		if cls == "MeshPart" then
+			if inst.TextureID ~= "" then save(inst, "TextureID", "") end
+			local sa = inst:FindFirstChildOfClass("SurfaceAppearance")
+			if sa then save(sa, "ColorMap", "") end
+		end
+
+		if isVegetation(inst, mat) then
+			save(inst, "Transparency", 1)
+		end
+		optimized = optimized + 1
+		return
+	end
+
+	if inst:IsA("Decal") then save(inst, "Transparency", 1) return end
+	if inst:IsA("Light") then save(inst, "Enabled", false) return end
+
+	local ep = EFFECT_PROP[cls]
+	if ep then save(inst, ep, false) return end
+
+	if cls == "Sky" or cls == "Atmosphere" or cls == "Clouds" then
+		save(inst, "Parent", nil)
+	end
+end
+
+---------------------------------------------------------------
+-- QUEUE
+---------------------------------------------------------------
+local function enqueue(inst)
+	if queued[inst] then return end
+	queued[inst] = true
+	queue[#queue + 1] = inst
+end
+
+local function startWorker()
+	if worker then return end
+	worker = task.spawn(function()
+		while active do
+			local budget = 220
+			while active and qHead <= #queue and budget > 0 do
+				local inst = queue[qHead]
+				queue[qHead] = nil
+				qHead = qHead + 1
+				budget = budget - 1
+				if inst then
+					pcall(process, inst)
+					queued[inst] = nil
+				end
+			end
+			if qHead > #queue then
+				queue = {}
+				qHead = 1
+			end
+			task.wait()
+		end
+		worker = nil
+	end)
+end
+
+local function scan()
+	local ok, list = pcall(function() return Workspace:GetDescendants() end)
+	if ok and list then
+		for i = 1, #list do enqueue(list[i]) end
+	end
+	local ok2, list2 = pcall(function() return Lighting:GetDescendants() end)
+	if ok2 and list2 then
+		for i = 1, #list2 do enqueue(list2[i]) end
+	end
+end
+
+local function applyWorld()
+	save(Lighting, "GlobalShadows", false)
+	save(Lighting, "Brightness", 1.6)
+	save(Lighting, "Ambient", Color3.fromRGB(118, 118, 118))
+	save(Lighting, "OutdoorAmbient", Color3.fromRGB(126, 126, 126))
+	save(Lighting, "EnvironmentDiffuseScale", 0)
+	save(Lighting, "EnvironmentSpecularScale", 0)
+	save(Lighting, "ExposureCompensation", 0)
+	save(Lighting, "FogStart", 1e6)
+	save(Lighting, "FogEnd", 1e6)
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		save(terrain, "Decoration", false)
+		save(terrain, "WaterWaveSize", 0)
+		save(terrain, "WaterWaveSpeed", 0)
+		save(terrain, "WaterReflectance", 0)
+		save(terrain, "WaterTransparency", 0.8)
+	end
+end
+
+---------------------------------------------------------------
+-- TRACKER (persistent, self-healing)
+---------------------------------------------------------------
+local function paintHighlight(plr)
+	local h = highlights[plr]
+	if not h then return end
+	local isTarget = (plr == currentTarget) or (autoAim and plr == autoTarget)
+	if isTarget then
+		h.OutlineColor = TARGET_COL
+		h.FillColor = TARGET_COL
+		h.FillTransparency = 0.72
+	else
+		h.OutlineColor = RED
+		h.FillColor = RED
+		h.FillTransparency = 1
+	end
+	h.OutlineTransparency = 0
+end
+
+local function repaintAll()
+	for plr in pairs(highlights) do
+		pcall(paintHighlight, plr)
+	end
+end
+
+local function ensureFolder()
+	if espFolder and espFolder.Parent then return espFolder end
+	local f = Instance.new("Folder")
+	f.Name = "PME_ESP"
+	f.Parent = Workspace
+	espFolder = f
+	return f
+end
+
+local function removeHighlight(plr)
+	local h = highlights[plr]
+	highlights[plr] = nil
+	if h then pcall(function() h:Destroy() end) end
+end
+
+local function removeAllHighlights()
+	for plr in pairs(highlights) do removeHighlight(plr) end
+	highlights = {}
+	if espFolder then
+		pcall(function() espFolder:Destroy() end)
+		espFolder = nil
+	end
+end
+
+local function reconcile()
+	if not active then return end
+	local folder = ensureFolder()
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			local char = plr.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			local alive = char and char.Parent and hum and hrp and hum.Health > 0
+
+			if alive then
+				local h = highlights[plr]
+				if not h or not h.Parent then
+					if h then pcall(function() h:Destroy() end) end
+					h = Instance.new("Highlight")
+					h.Name = plr.Name
+					h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					h.FillTransparency = 1
+					h.OutlineTransparency = 0
+					h.OutlineColor = RED
+					h.FillColor = RED
+					h.Parent = folder
+					highlights[plr] = h
+					paintHighlight(plr)
+				end
+				if h.Adornee ~= char then h.Adornee = char end
+			else
+				if highlights[plr] then removeHighlight(plr) end
+			end
+		end
+	end
+
+	local dead = {}
+	for plr in pairs(highlights) do
+		if not plr.Parent or plr == LP then dead[#dead + 1] = plr end
+	end
+	for _, plr in ipairs(dead) do removeHighlight(plr) end
+end
+
+---------------------------------------------------------------
+-- AIM
+---------------------------------------------------------------
+local function aimPoint(char)
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if hrp then return hrp.Position + Vector3.new(0, 0.45, 0) end
+	local head = char:FindFirstChild("Head")
+	if head then return head.Position end
+	return nil
+end
+
+local function nearestPlayer(fromPos)
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
+	local best, bestDist = nil, math.huge
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			local char = plr.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if hum and hrp and hum.Health > 0 then
+				local d = (hrp.Position - fromPos).Magnitude
+				if d < bestDist then
+					best, bestDist = plr, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function onRender(dt)
+	if not active then return end
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+
+	if autoAim then
+		local n = nearestPlayer(cam.CFrame.Position)
+		if n ~= autoTarget then
+			autoTarget = n
+			task.spawn(repaintAll)
+		end
+	end
+
+	local target = currentTarget or autoTarget
+	if not target then return end
+
+	local char = target.Character
+	if not char or not char.Parent then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+
+	local point = aimPoint(char)
+	if not point then return end
+
+	local alpha = math.clamp(aimSpeed * dt * 60, 0, 1)
+
+	-- scriptable cameras often ignore CFrame writes: drive the real mouse instead
+	if cam.CameraType == Enum.CameraType.Scriptable then
+		if typeof(mousemoverel) == "function" then
+			local pos, onScreen = cam:WorldToViewportPoint(point)
+			if onScreen then
+				local vp = cam.ViewportSize
+				local dx = (pos.X - vp.X * 0.5) * alpha
+				local dy = (pos.Y - vp.Y * 0.5) * alpha
+				if math.abs(dx) > 0.4 or math.abs(dy) > 0.4 then
+					pcall(mousemoverel, dx, dy)
+				end
+			end
+		end
+	end
+
+	local desired = CFrame.lookAt(cam.CFrame.Position, point)
+	cam.CFrame = cam.CFrame:Lerp(desired, alpha)
+end
+
+---------------------------------------------------------------
+-- GUI
+---------------------------------------------------------------
+local function guiParent()
+	if gethui then
+		local ok, h = pcall(gethui)
+		if ok and h then return h end
+	end
+	return LP:WaitForChild("PlayerGui")
+end
+
+local function mk(cls, props, parent)
+	local o = Instance.new(cls)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+
+local ICONS = {"\u{1F954}", "\u{26A1}", "\u{1F525}", "\u{2699}", "\u{2726}", "\u{25C6}", "\u{2605}", "\u{2620}"}
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "PotatoModeExtreme"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 10000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = guiParent()
+ENV.PME_GUI = gui
+
+local FULL_H, MIN_H, WIN_W = 392, 104, 244
+
+local main = Instance.new("Frame")
+main.Name = "Window"
+main.Size = UDim2.fromOffset(WIN_W, FULL_H)
+main.Position = UDim2.new(1, -(WIN_W + 12), 0, 76)
+main.BackgroundColor3 = BG
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 14)
+corner.Parent = main
+
+local border = Instance.new("UIStroke")
+border.Color = NEON
+border.Thickness = 1.6
+border.Transparency = 0.15
+border.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+border.Parent = main
+
+local header = mk("Frame", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Active = true,
+}, main)
+
+mk("TextLabel", {
+	Size = UDim2.fromOffset(24, 24),
+	Position = UDim2.fromOffset(9, 3),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 15,
+	TextColor3 = NEON,
+	Text = ICONS[math.random(1, #ICONS)],
+}, header)
+
+mk("TextLabel", {
+	Size = UDim2.new(1, -76, 1, 0),
+	Position = UDim2.fromOffset(37, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	TextColor3 = TEXT,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Text = "POTATO MODE EXTREME",
+}, header)
+
+local collapse = mk("TextButton", {
+	Size = UDim2.fromOffset(22, 22),
+	Position = UDim2.new(1, -28, 0, 4),
+	BackgroundColor3 = PANEL,
+	BackgroundTransparency = 0.35,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = MUTED,
+	Text = "\u{2013}",
+}, header)
+local cc = Instance.new("UICorner")
+cc.CornerRadius = UDim.new(0, 6)
+cc.Parent = collapse
+
+local body = mk("Frame", {
+	Size = UDim2.new(1, 0, 0, FULL_H - 30),
+	Position = UDim2.fromOffset(0, 30),
+	BackgroundTransparency = 1,
+}, main)
+
+local status = mk("TextLabel", {
+	Size = UDim2.new(1, -20, 0, 16),
+	Position = UDim2.fromOffset(10, 4),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 10,
+	TextColor3 = MUTED,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "STATUS: DISABLED",
+}, body)
+
+local btn = mk("TextButton", {
+	Size = UDim2.new(1, -20, 0, 46),
+	Position = UDim2.fromOffset(10, 22),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBlack,
+	TextSize = 15,
+	TextColor3 = MUTED,
+	Text = "ENABLE",
+}, body)
+local bc = Instance.new("UICorner")
+bc.CornerRadius = UDim.new(0, 10)
+bc.Parent = btn
+local bs = Instance.new("UIStroke")
+bs.Color = NEON_DIM
+bs.Thickness = 1
+bs.Transparency = 0.25
+bs.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+bs.Parent = btn
+
+mk("Frame", {
+	Size = UDim2.new(1, -20, 0, 1),
+	Position = UDim2.fromOffset(10, 74),
+	BackgroundColor3 = Color3.fromRGB(40, 40, 40),
+	BorderSizePixel = 0,
+}, body)
+
+mk("TextLabel", {
+	Size = UDim2.new(1, -20, 0, 12),
+	Position = UDim2.fromOffset(10, 80),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 9,
+	TextColor3 = MUTED,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "TRACKED TARGET",
+}, body)
+
+local list = mk("ScrollingFrame", {
+	Size = UDim2.new(1, -20, 0, 130),
+	Position = UDim2.fromOffset(10, 94),
+	BackgroundColor3 = Color3.fromRGB(12, 12, 12),
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = NEON_DIM,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, body)
+local lc = Instance.new("UICorner")
+lc.CornerRadius = UDim.new(0, 8)
+lc.Parent = list
+local lp = Instance.new("UIPadding")
+lp.PaddingTop = UDim.new(0, 3)
+lp.PaddingBottom = UDim.new(0, 3)
+lp.PaddingLeft = UDim.new(0, 3)
+lp.PaddingRight = UDim.new(0, 3)
+lp.Parent = list
+local ll = Instance.new("UIListLayout")
+ll.Padding = UDim.new(0, 2)
+ll.SortOrder = Enum.SortOrder.LayoutOrder
+ll.Parent = list
+
+local clearBtn = mk("TextButton", {
+	Size = UDim2.new(1, -20, 0, 26),
+	Position = UDim2.fromOffset(10, 230),
+	BackgroundColor3 = Color3.fromRGB(22, 12, 12),
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	TextColor3 = Color3.fromRGB(205, 125, 125),
+	Text = "CLEAR TARGET",
+}, body)
+local clc = Instance.new("UICorner")
+clc.CornerRadius = UDim.new(0, 8)
+clc.Parent = clearBtn
+
+mk("TextLabel", {
+	Size = UDim2.fromOffset(120, 12),
+	Position = UDim2.fromOffset(10, 262),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 9,
+	TextColor3 = MUTED,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "AIM SPEED",
+}, body)
+
+local speedVal = mk("TextLabel", {
+	Size = UDim2.fromOffset(60, 12),
+	Position = UDim2.new(1, -70, 0, 262),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 9,
+	TextColor3 = NEON_DIM,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Text = "55%",
+}, body)
+
+local speedTrack = mk("Frame", {
+	Size = UDim2.new(1, -20, 0, 6),
+	Position = UDim2.fromOffset(10, 280),
+	BackgroundColor3 = Color3.fromRGB(38, 38, 38),
+	BorderSizePixel = 0,
+	Active = true,
+}, body)
+local tc = Instance.new("UICorner")
+tc.CornerRadius = UDim.new(1, 0)
+tc.Parent = speedTrack
+
+local speedFill = mk("Frame", {
+	Size = UDim2.new(aimSpeed, 0, 1, 0),
+	BackgroundColor3 = NEON_DIM,
+	BorderSizePixel = 0,
+}, speedTrack)
+local fc = Instance.new("UICorner")
+fc.CornerRadius = UDim.new(1, 0)
+fc.Parent = speedFill
+
+local speedKnob = mk("Frame", {
+	Size = UDim2.fromOffset(13, 13),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.new(aimSpeed, 0, 0.5, 0),
+	BackgroundColor3 = NEON,
+	BorderSizePixel = 0,
+}, speedTrack)
+local kc = Instance.new("UICorner")
+kc.CornerRadius = UDim.new(1, 0)
+kc.Parent = speedKnob
+
+local foot = mk("TextLabel", {
+	Size = UDim2.new(1, -20, 0, 14),
+	Position = UDim2.fromOffset(10, 298),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	TextSize = 9,
+	TextColor3 = MUTED,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "idle",
+}, body)
+
+---------------------------------------------------------------
+-- ROWS
+---------------------------------------------------------------
+local rows = {}
+
+local function makeRow(order, label, selected, onTap)
+	local row = mk("TextButton", {
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundColor3 = selected and Color3.fromRGB(10, 40, 22) or PANEL,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		TextColor3 = selected and TARGET_COL or TEXT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "  " .. label,
+		LayoutOrder = order,
+	}, list)
+
+	local rc = Instance.new("UICorner")
+	rc.CornerRadius = UDim.new(0, 6)
+	rc.Parent = row
+
+	local dot = mk("Frame", {
+		Size = UDim2.fromOffset(6, 6),
+		Position = UDim2.new(1, -14, 0.5, -3),
+		BackgroundColor3 = selected and TARGET_COL or RED,
+		BorderSizePixel = 0,
+	}, row)
+	local dc = Instance.new("UICorner")
+	dc.CornerRadius = UDim.new(1, 0)
+	dc.Parent = dot
+
+	row.Activated:Connect(onTap)
+	return row
+end
+
+refreshRows = function()
+	for _, r in pairs(rows) do
+		if r.Parent then r:Destroy() end
+	end
+	rows = {}
+
+	makeRow(1, "AUTO  \u{2022}  NEAREST", autoAim, function()
+		autoAim = true
+		currentTarget = nil
+		autoTarget = nil
+		refreshRows()
+		repaintAll()
+	end)
+
+	local index = 1
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			index = index + 1
+			rows[plr] = makeRow(index, plr.Name, (plr == currentTarget), function()
+				if currentTarget == plr then
+					currentTarget = nil
+				else
+					currentTarget = plr
+					autoAim = false
+					autoTarget = nil
+				end
+				refreshRows()
+				repaintAll()
+			end)
+		end
+	end
+
+	if index == 1 then
+		mk("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 28),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 9,
+			TextColor3 = MUTED,
+			Text = "no other players",
+			LayoutOrder = 2,
+		}, list)
+	end
+end
+
+---------------------------------------------------------------
+-- VISUALS
+---------------------------------------------------------------
+local EASE = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function setVisual(on)
+	if on then
+		TweenService:Create(btn, EASE, {BackgroundColor3 = Color3.fromRGB(15, 38, 11), TextColor3 = NEON}):Play()
+		TweenService:Create(bs, EASE, {Color = NEON, Transparency = 0}):Play()
+		TweenService:Create(status, EASE, {TextColor3 = NEON}):Play()
+		status.Text = "STATUS: ACTIVE"
+		btn.Text = "ACTIVE"
+	else
+		TweenService:Create(btn, EASE, {BackgroundColor3 = PANEL, TextColor3 = MUTED}):Play()
+		TweenService:Create(bs, EASE, {Color = NEON_DIM, Transparency = 0.25}):Play()
+		TweenService:Create(status, EASE, {TextColor3 = MUTED}):Play()
+		status.Text = "STATUS: DISABLED"
+		btn.Text = "ENABLE"
+	end
+end
+
+---------------------------------------------------------------
+-- ENABLE / DISABLE
+---------------------------------------------------------------
+local function enable()
+	if active or restoring then return end
+	active = true
+	optimized = 0
+
+	pcall(applyWorld)
+
+	table.insert(conns, Workspace.DescendantAdded:Connect(function(d)
+		if active then enqueue(d) end
+	end))
+	table.insert(conns, Lighting.DescendantAdded:Connect(function(d)
+		if active then enqueue(d) end
+	end))
+
+	scan()
+	startWorker()
+
+	reconcile()
+
+	pcall(function()
+		RunService:UnbindFromRenderStep("PME_AIM")
+		RunService:BindToRenderStep("PME_AIM", Enum.RenderPriority.Camera.Value + 50, onRender)
+	end)
+end
+
+local function disable(finished)
+	if not active then
+		if finished then finished() end
+		return
+	end
+	active = false
+	autoTarget = nil
+
+	pcall(function() RunService:UnbindFromRenderStep("PME_AIM") end)
+	removeAllHighlights()
+
+	for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+	conns = {}
+	queue = {}
+	qHead = 1
+	queued = {}
+
+	optimized = 0
+	restoring = true
+	restoreAll(function()
+		restoring = false
+		if finished then finished() end
+	end)
+end
+
+---------------------------------------------------------------
+-- TOGGLE
+---------------------------------------------------------------
+btn.Activated:Connect(function()
+	if busy or restoring then return end
+	busy = true
+
+	TweenService:Create(btn, TweenInfo.new(0.08), {Size = UDim2.new(1, -24, 0, 43)}):Play()
+	task.delay(0.09, function()
+		TweenService:Create(btn, TweenInfo.new(0.12), {Size = UDim2.new(1, -20, 0, 46)}):Play()
+	end)
+
+	if active then
+		setVisual(false)
+		disable(function() busy = false end)
+	else
+		local ok = pcall(enable)
+		if ok then
+			setVisual(true)
+		else
+			active = false
+		end
+		task.delay(0.35, function() busy = false end)
+	end
+end)
+
+clearBtn.Activated:Connect(function()
+	currentTarget = nil
+	autoAim = false
+	autoTarget = nil
+	refreshRows()
+	repaintAll()
+end)
+
+---------------------------------------------------------------
+-- COLLAPSE
+---------------------------------------------------------------
+local collapsed = false
+collapse.Activated:Connect(function()
+	collapsed = not collapsed
+	if collapsed then
+		body.Visible = false
+		TweenService:Create(main, TweenInfo.new(0.2), {Size = UDim2.fromOffset(WIN_W, MIN_H)}):Play()
+		collapse.Text = "+"
+	else
+		TweenService:Create(main, TweenInfo.new(0.2), {Size = UDim2.fromOffset(WIN_W, FULL_H)}):Play()
+		task.delay(0.12, function() body.Visible = true end)
+		collapse.Text = "\u{2013}"
+	end
+end)
+
+---------------------------------------------------------------
+-- DRAG
+---------------------------------------------------------------
+local dragging, dragStart, startPos = false, nil, nil
+
+header.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = main.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then return end
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+		local d = input.Position - dragStart
+		main.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + d.X,
+			startPos.Y.Scale, startPos.Y.Offset + d.Y
+		)
+	end
+end)
+
+---------------------------------------------------------------
+-- SLIDER
+---------------------------------------------------------------
+local function setSpeed(v)
+	aimSpeed = math.clamp(v, 0.05, 1)
+	speedKnob.Position = UDim2.new(aimSpeed, 0, 0.5, 0)
+	speedFill.Size = UDim2.new(aimSpeed, 0, 1, 0)
+	speedVal.Text = ("%d%%"):format(math.floor(aimSpeed * 100))
+end
+
+local function speedFromX(x)
+	local rel = (x - speedTrack.AbsolutePosition.X) / math.max(speedTrack.AbsoluteSize.X, 1)
+	setSpeed(rel)
+end
+
+speedTrack.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		speedFromX(input.Position.X)
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then return end
+			if input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch then
+				speedFromX(input.Position.X)
+			end
+		end)
+	end
+end)
+
+setSpeed(aimSpeed)
+
+---------------------------------------------------------------
+-- PLAYER WATCHERS
+---------------------------------------------------------------
+local function watchPlayer(plr)
+	if plr == LP or playerWatches[plr] then return end
+
+	local c1 = plr.CharacterAdded:Connect(function()
+		if active then
+			task.defer(reconcile)
+		end
+		refreshRows()
+	end)
+	local c2 = plr.CharacterRemoving:Connect(function()
+		removeHighlight(plr)
+	end)
+	playerWatches[plr] = { c1, c2 }
+
+	if active then pcall(reconcile) end
+	refreshRows()
+end
+
+local function unwatchPlayer(plr)
+	local w = playerWatches[plr]
+	if w then
+		for i = 1, #w do pcall(function() w[i]:Disconnect() end) end
+		playerWatches[plr] = nil
+	end
+	removeHighlight(plr)
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do watchPlayer(plr) end
+
+Players.PlayerAdded:Connect(watchPlayer)
+Players.PlayerRemoving:Connect(function(plr)
+	unwatchPlayer(plr)
+	if currentTarget == plr then currentTarget = nil end
+	if autoTarget == plr then autoTarget = nil end
+	refreshRows()
+end)
+
+refreshRows()
+
+---------------------------------------------------------------
+-- LOOPS
+---------------------------------------------------------------
+task.spawn(function()
+	local pulse = TweenInfo.new(1.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+	local tween = TweenService:Create(border, pulse, {Transparency = 0.45})
+	while true do
+		while not active do task.wait(0.15) end
+		tween:Play()
+		while active do task.wait(0.1) end
+		tween:Cancel()
+		border.Transparency = 0.15
+	end
+end)
+
+-- self-healing tracker reconcile
+task.spawn(function()
+	while true do
+		task.wait(0.35)
+		if active then pcall(reconcile) end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		if active then
+			foot.Text = ("opt:%d  esp:%d  target:%s"):format(
+				optimized,
+				(function() local n = 0 for _ in pairs(highlights) do n = n + 1 end return n end)(),
+				currentTarget and currentTarget.Name or (autoAim and "AUTO" or "none")
+			)
+		elseif restoring then
+			foot.Text = "restoring..."
+		else
+			foot.Text = "idle"
+		end
+	end
+end)
+
+---------------------------------------------------------------
+-- SHUTDOWN
+---------------------------------------------------------------
+ENV.PME = {
+	shutdown = function()
+		pcall(disable)
+		for plr in pairs(playerWatches) do unwatchPlayer(plr) end
+		removeAllHighlights()
+		pcall(function() RunService:UnbindFromRenderStep("PME_AIM") end)
+		pcall(function() gui:Destroy() end)
+		ENV.PME_GUI = nil
+	end,
+}
+
+print("[POTATO MODE EXTREME] v3 loaded")
