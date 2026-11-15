@@ -1,0 +1,8 @@
+{
+  "name": "Hidden Channels",
+  "description": "Lists channels you have no access to, with their names and metadata.",
+  "authors": [{ "name": "you", "id": "0" }],
+  "main": "index.js",
+  "vendetta": { "icon": "ic_lock" },
+  "hash": "6b4ff87643945b4a7f217c0d1283a3126f452bc88b43e51ec7cf42f4cbc456ca"
+}
